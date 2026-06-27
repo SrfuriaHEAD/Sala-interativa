@@ -1,0 +1,24 @@
+{
+  "nQuiz": 3,
+  "gabLiberado": false,
+  "qs": [
+    {
+      "txt": "O numero mensal de passagens de certa empresa aerea: jan=33.000, fev=34.500, mar=36.000. Padrao se mantem. Quantas em julho?",
+      "a": "38.000", "b": "40.500", "c": "41.000", "d": "42.000",
+      "gab": "D",
+      "obs": "PA com razao 1500. a7 = 33000 + 6x1500 = 42.000."
+    },
+    {
+      "txt": "Numa PA, o primeiro termo e 5 e a razao e 3. Qual e o 10 termo?",
+      "a": "28", "b": "30", "c": "32", "d": "35",
+      "gab": "C",
+      "obs": "an = a1 + (n-1)*r -> a10 = 5 + 9x3 = 32."
+    },
+    {
+      "txt": "Os 5 primeiros termos de uma PA sao 2, 5, 8, 11, 14. Qual e a soma?",
+      "a": "35", "b": "38", "c": "40", "d": "42",
+      "gab": "C",
+      "obs": "Sn = n*(a1+an)/2 = 5*(2+14)/2 = 40."
+    }
+  ]
+}
