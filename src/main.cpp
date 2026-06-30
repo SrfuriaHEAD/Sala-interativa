@@ -6,6 +6,7 @@
 #include <ESPmDNS.h>
 #include <DNSServer.h>
 
+
 #define GPIO_PIN   4
 #define LED_PIN    48
 #define BAUD       115200
@@ -106,7 +107,8 @@ String admSess[MAX_ADM];
 int nAdm = 0;
 
 AsyncWebServer server(80);
-DNSServer dnsServer;
+DNSServer      dnsServer;
+
 
 // ── Persistência periódica de sessão (evita LittleFS blocking por requisição) ──
 volatile bool sessaoDirty = false;
@@ -1168,6 +1170,7 @@ select.inp2{cursor:pointer}
     <button class="tab" onclick="aba('quiz')">Quiz</button>
     <button class="tab" onclick="aba('alunos')">Alunos</button>
     <button class="tab" onclick="aba('historico')">Histórico</button>
+    <button class="tab" onclick="aba('materiais')">Materiais</button>
   </div>
 
   <!-- ABA: GERAL -->
@@ -1245,17 +1248,119 @@ select.inp2{cursor:pointer}
       <div id="histDetConteudo"></div>
     </div>
   </div>
+
+  <!-- ABA: MATERIAIS -->
+  <div class="tab-pane" id="pane-materiais">
+    <div class="card">
+      <div class="sect">📁 Materiais de Referência</div>
+      <p style="font-size:.6rem;color:var(--mu);line-height:1.6;margin-bottom:.85rem">Imagens do quadro, PDFs e documentos para usar como referência durante a aula.</p>
+      <button class="btn btn-ac btn-sm" style="width:100%" onclick="abrirModalMaterial()">+ Adicionar material</button>
+    </div>
+    <div class="card">
+      <div class="sect">📋 Lista de materiais</div>
+      <div id="listaMateriais">
+        <div style="text-align:center;padding:1.5rem 0">
+          <div style="font-size:2rem;margin-bottom:.5rem;opacity:.3">📂</div>
+          <p style="font-size:.6rem;color:var(--mu);letter-spacing:.06em">Nenhum material adicionado ainda.</p>
+          <p style="font-size:.54rem;color:var(--mu2);margin-top:.3rem">Em breve: armazenamento no ESP.</p>
+        </div>
+      </div>
+    </div>
+  </div>
 </div>
+
+<!-- inputs de arquivo — um por tipo, label associado troca o for conforme seleção -->
+<input type="file" id="inputImg" style="position:absolute;opacity:0;width:0;height:0;pointer-events:none" accept="image/*" onchange="onArquivoSelecionado()">
+<input type="file" id="inputPdf" style="position:absolute;opacity:0;width:0;height:0;pointer-events:none" accept=".pdf,application/pdf" onchange="onArquivoSelecionado()">
+<input type="file" id="inputDoc" style="position:absolute;opacity:0;width:0;height:0;pointer-events:none" accept=".doc,.docx,.odt,.txt,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onchange="onArquivoSelecionado()">
+
+<!-- MODAL: ADICIONAR MATERIAL -->
+<div class="ov" id="ovMaterial">
+  <div class="modal" style="max-width:340px">
+    <h2>Novo material</h2>
+    <p style="font-size:.6rem;color:var(--mu);margin-bottom:.9rem;line-height:1.5">Escolha o tipo e toque em Selecionar arquivo.</p>
+
+    <label style="font-size:.55rem;color:var(--mu);letter-spacing:.1em;text-transform:uppercase;display:block;margin-bottom:.45rem">Tipo</label>
+    <div style="display:flex;gap:.4rem;margin-bottom:.85rem">
+      <button id="tipo-img" onclick="selecionarTipo('img')" style="flex:1;border-radius:8px;border:1px solid var(--b);font-family:'IBM Plex Mono',monospace;font-size:.62rem;padding:.55rem .2rem;cursor:pointer;transition:all .2s;background:var(--ac);color:#1a0a00;border-color:transparent">📷 Imagem</button>
+      <button id="tipo-pdf" onclick="selecionarTipo('pdf')" style="flex:1;border-radius:8px;border:1px solid var(--b);font-family:'IBM Plex Mono',monospace;font-size:.62rem;padding:.55rem .2rem;cursor:pointer;transition:all .2s;background:var(--b2);color:var(--mu)">📄 PDF</button>
+      <button id="tipo-doc" onclick="selecionarTipo('doc')" style="flex:1;border-radius:8px;border:1px solid var(--b);font-family:'IBM Plex Mono',monospace;font-size:.62rem;padding:.55rem .2rem;cursor:pointer;transition:all .2s;background:var(--b2);color:var(--mu)">📝 Doc</button>
+    </div>
+
+    <!-- área de arquivo selecionado -->
+    <div id="arquivoInfo" style="background:var(--b);border-radius:8px;padding:.6rem .75rem;margin-bottom:.6rem;font-size:.6rem;color:var(--mu);display:flex;align-items:center;justify-content:space-between;gap:.5rem">
+      <span id="arquivoNomeExib" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Nenhum arquivo</span>
+      <label id="btnSelecionar" for="inputImg" style="background:var(--ac);color:#1a0a00;border:none;border-radius:6px;padding:.32rem .65rem;font-family:'IBM Plex Mono',monospace;font-size:.58rem;font-weight:600;cursor:pointer;white-space:nowrap;display:inline-block;line-height:1.8">Selecionar</label>
+    </div>
+
+    <label style="font-size:.55rem;color:var(--mu);letter-spacing:.1em;text-transform:uppercase;display:block;margin-bottom:.35rem">Descrição (opcional)</label>
+    <input type="text" id="nomeMaterial" class="inp" placeholder="Ex: Foto do quadro — 3ª aula" maxlength="60" style="margin-bottom:.7rem">
+
+    <p class="merr" id="erroMaterial"></p>
+    <div class="mbtns">
+      <button class="mok" onclick="confirmarMaterial()">ADICIONAR</button>
+      <button class="mno" onclick="fecharModalMaterial()">✕</button>
+    </div>
+  </div>
+</div>
+
 <div id="toast"></div>
 <script>
 var ultimoD={};
 function esc(s){if(!s)return'';var d=document.createElement('div');d.appendChild(document.createTextNode(s));return d.innerHTML}
 function toast(m){var e=document.getElementById('toast');e.textContent=m;e.classList.add('show');setTimeout(()=>e.classList.remove('show'),2200)}
 function aba(id){
-  document.querySelectorAll('.tab').forEach(function(t,i){t.classList.toggle('ativo',['geral','quiz','alunos','historico'][i]===id)});
+  document.querySelectorAll('.tab').forEach(function(t,i){t.classList.toggle('ativo',['geral','quiz','alunos','historico','materiais'][i]===id)});
   document.querySelectorAll('.tab-pane').forEach(function(p){p.classList.remove('ativo')});
   document.getElementById('pane-'+id).classList.add('ativo');
   if(id==='historico') carregarHistorico();
+}
+
+// ── Modal Materiais ──
+var tipoAtual='img';
+function _inputId(t){return 'input'+(t==='img'?'Img':t==='pdf'?'Pdf':'Doc');}
+function abrirModalMaterial(){
+  tipoAtual='img';
+  _atualizarTipos();
+  ['Img','Pdf','Doc'].forEach(function(s){document.getElementById('input'+s).value='';});
+  document.getElementById('arquivoNomeExib').textContent='Nenhum arquivo';
+  document.getElementById('nomeMaterial').value='';
+  document.getElementById('erroMaterial').textContent='';
+  document.getElementById('ovMaterial').classList.add('open');
+}
+function fecharModalMaterial(){
+  document.getElementById('ovMaterial').classList.remove('open');
+}
+function selecionarTipo(t){
+  tipoAtual=t;
+  _atualizarTipos();
+  document.getElementById('btnSelecionar').setAttribute('for',_inputId(t));
+  document.getElementById(_inputId(t)).value='';
+  document.getElementById('arquivoNomeExib').textContent='Nenhum arquivo';
+}
+function _atualizarTipos(){
+  ['img','pdf','doc'].forEach(function(t){
+    var b=document.getElementById('tipo-'+t);
+    var on=t===tipoAtual;
+    b.style.background=on?'var(--ac)':'var(--b2)';
+    b.style.color=on?'#1a0a00':'var(--mu)';
+    b.style.borderColor=on?'transparent':'var(--b)';
+  });
+  document.getElementById('btnSelecionar').setAttribute('for',_inputId(tipoAtual));
+}
+function onArquivoSelecionado(){
+  var f=document.getElementById(_inputId(tipoAtual)).files[0];
+  document.getElementById('arquivoNomeExib').textContent=f?f.name:'Nenhum arquivo';
+  document.getElementById('erroMaterial').textContent='';
+}
+function confirmarMaterial(){
+  var f=document.getElementById(_inputId(tipoAtual)).files[0];
+  var err=document.getElementById('erroMaterial');
+  if(!f){err.textContent='Selecione um arquivo primeiro.';return;}
+  err.textContent='';
+  var nome=document.getElementById('nomeMaterial').value.trim()||f.name;
+  toast('Material "'+nome+'" recebido (armazenamento em breve) ✓');
+  fecharModalMaterial();
 }
 function fmtTempo(ms){if(!ms||ms<=0)return'—';if(ms<1000)return ms+'ms';return Math.round(ms/1000)+'s';}
 
@@ -1954,35 +2059,44 @@ void sendStaticPage(AsyncWebServerRequest* request, const char* pgmStr){
 //  ROUTE HANDLERS
 // ════════════════════════════════════════════════════════
 void hCaptive(AsyncWebServerRequest* req){
-  String url = req->url();
+  String url  = req->url();
+  String host = req->host();
 
-  // Android — espera exatamente 204 sem body
-  if(url == "/generate_204" || url == "/gen_204"){
-    req->send(204);
+  Serial.printf("[CAPTIVE] %s%s\n", host.c_str(), url.c_str());
+
+  // ── NetworkManager (ArchLinux / Ubuntu) ──────────────────────────────────
+  if(url == "/nm-check.txt" || url == "/check_200_public.txt"){
+    req->send(200, "text/plain", "NetworkManager is online\n");
+    Serial.println("[CAPTIVE] → 200 NetworkManager");
     return;
   }
-  // iOS / macOS — espera "<HTML>...<TITLE>Success</TITLE>..."
+
+  // ── iOS / macOS ──────────────────────────────────────────────────────────
   if(url == "/hotspot-detect.html" || url == "/library/test/success.html"){
     req->send(200,"text/html","<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>");
+    Serial.println("[CAPTIVE] → 200 Success (iOS)");
     return;
   }
-  // Windows NCSI
+
+  // ── Windows NCSI ─────────────────────────────────────────────────────────
   if(url == "/ncsi.txt"){
     req->send(200,"text/plain","Microsoft NCSI");
+    Serial.println("[CAPTIVE] → 200 NCSI");
     return;
   }
   if(url == "/connecttest.txt"){
     req->send(200,"text/plain","Microsoft Connect Test");
+    Serial.println("[CAPTIVE] → 200 connecttest");
     return;
   }
 
-  // Qualquer outra URL — redireciona para a página principal
+  // ── Qualquer outra URL — 302 para página principal ───────────────────────
   String ip = WiFi.localIP().toString();
-  String html = "<html><head><meta http-equiv='refresh' content='0;url=http://" + ip + "/'></head>"
-                "<body><p>Redirecionando...</p>"
-                "<a href='http://" + ip + "/'>Toque aqui para abrir a Sala Interativa</a>"
-                "<script>window.location='http://" + ip + "/';</script></body></html>";
-  req->send(200, "text/html", html);
+  AsyncWebServerResponse* r = req->beginResponse(302);
+  r->addHeader("Location", "http://" + ip + "/");
+  r->addHeader("Cache-Control", "no-cache");
+  req->send(r);
+  Serial.printf("[CAPTIVE] → 302 → http://%s/\n", ip.c_str());
 }
 
 void hIndex(AsyncWebServerRequest* req)       { sendCachedPage(req, CACHE_INDEX); }
@@ -2277,6 +2391,7 @@ void hAdmHistDel(AsyncWebServerRequest* req){
   req->send(200,"application/json",jsonListaHist());
 }
 
+
 // ════════════════════════════════════════════════════════
 //  SETUP / LOOP
 // ════════════════════════════════════════════════════════
@@ -2306,14 +2421,14 @@ void setup(){
 
   // IP fixo — deve bater com o que está configurado no D-Link como DNS primário
   IPAddress localIP(192, 168, 0, 101);
-  IPAddress gateway(192, 168, 0, 1);
+  IPAddress gateway(192, 168, 0, 254);
   IPAddress subnet(255, 255, 255, 0);
-  IPAddress dns1(192, 168, 0, 1);
+  IPAddress dns1(192, 168, 0, 254);
   WiFi.config(localIP, gateway, subnet, dns1);
 
   int tentativas = 0;
   const int MAX_TENTATIVAS = 20;
-  WiFi.begin("SI-2.4G", "123445678");
+  WiFi.begin("SI-2.4G", "");
 
   while(WiFi.status() != WL_CONNECTED && tentativas < MAX_TENTATIVAS){
     delay(1000);
@@ -2391,16 +2506,14 @@ void setup(){
   server.on("/admin/historico",     HTTP_GET, hAdmHistorico);
   server.on("/admin/histData",      HTTP_GET, hAdmHistData);
   server.on("/admin/histDel",       HTTP_GET, hAdmHistDel);
-  // Captive portal — tudo centralizado em hCaptive
-  // hCaptive detecta as URLs de connectivity check e responde corretamente;
-  // qualquer outra URL desconhecida redireciona para a página principal.
-  server.on("/generate_204",           HTTP_GET, hCaptive);
-  server.on("/gen_204",                HTTP_GET, hCaptive);
-  server.on("/connecttest.txt",        HTTP_GET, hCaptive);
-  server.on("/ncsi.txt",               HTTP_GET, hCaptive);
-  server.on("/hotspot-detect.html",    HTTP_GET, hCaptive);
-  server.on("/library/test/success.html", HTTP_GET, hCaptive);
-  server.on("/redirect",               HTTP_GET, hCaptive);
+  // Captive portal — iOS, Windows, Linux
+  server.on("/nm-check.txt",             HTTP_GET, hCaptive);  // NetworkManager (Linux)
+  server.on("/check_200_public.txt",     HTTP_GET, hCaptive);  // GNOME NetworkManager
+  server.on("/connecttest.txt",          HTTP_GET, hCaptive);  // Windows
+  server.on("/ncsi.txt",                 HTTP_GET, hCaptive);  // Windows NCSI
+  server.on("/hotspot-detect.html",      HTTP_GET, hCaptive);  // iOS / macOS
+  server.on("/library/test/success.html",HTTP_GET, hCaptive);  // iOS fallback
+  server.on("/redirect",                 HTTP_GET, hCaptive);
   server.onNotFound(hCaptive);
 
   server.begin();
@@ -2408,7 +2521,7 @@ void setup(){
 
   // DNS server — responde qualquer domínio com o IP do ESP (captive portal via roteador)
   // No D-Link: configurar DNS primário dos clientes como 192.168.0.101
-  dnsServer.setTTL(300);
+  dnsServer.setTTL(1);   // TTL=1s — MIUI 14 não cacheia, sempre pergunta pro ESP
   dnsServer.start(53, "*", localIP);
   Serial.println("[DNS] Servidor DNS iniciado na porta 53");
   Serial.printf("ip: %s\n", WiFi.localIP().toString().c_str());
@@ -2418,8 +2531,7 @@ void setup(){
 }
 
 void loop(){
-  dnsServer.processNextRequest(); // processa requisições DNS do captive portal
-  // Salva sessão a cada 10s se houve mudança — evita blocking no handler de requisição
+  dnsServer.processNextRequest();
   unsigned long agora = millis();
   if(sessaoDirty && (agora - ultimoSalvamento >= SALVAR_INTERVALO_MS)){
     salvarSessao();
