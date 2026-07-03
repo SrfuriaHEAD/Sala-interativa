@@ -5,6 +5,7 @@
 #include <ArduinoJson.h>
 #include <ESPmDNS.h>
 #include <DNSServer.h>
+#include <esp_system.h>   // esp_reset_reason() — usado pra detectar queda de energia real
 
 
 #define GPIO_PIN   4
@@ -21,7 +22,25 @@ const char* ADMIN_PWD = "2REG3";
 #define PATH_QUIZ    "/quiz.json"
 #define PATH_LIVROS  "/livros.json"
 #define DIR_HIST     "/hist"
-#define MAX_HIST     20   // máximo de atividades arquivadas
+#define PATH_DIA     "/dia.json"      // contador persistido do "dia letivo" atual
+#define PATH_HISTSEQ "/histseq.json"  // contador sequencial de atividades arquivadas (nunca roda/expira)
+
+// true somente se o LittleFS montou com sucesso. Se false, o firmware continua
+// rodando (aula não para) mas em modo RAM-only — nada é persistido até alguém
+// resolver o problema físico (energia/flash). Isso é MELHOR do que formatar
+// sozinho e apagar sessão + histórico de anos.
+bool fsDisponivel = false;
+
+// ── Controle de "dia" sem NTP/internet ──────────────────────────────────
+// RTC_DATA_ATTR fica na memória RTC do ESP32: sobrevive a esp_restart(),
+// panic/watchdog reboot e brownout reset — mas é PERDIDA quando a energia
+// é cortada de verdade (desligou a tomada / USB à noite). Usamos isso pra
+// diferenciar "o ESP travou e reiniciou no meio da aula" (mesmo dia) de
+// "a escola desligou o dispositivo e ligou de novo" (dia novo).
+#define DIA_MAGIC 0xD1A0B33Fu
+RTC_DATA_ATTR uint32_t rtcMagicDia = 0;
+RTC_DATA_ATTR uint16_t rtcDiaAtual = 0;
+uint16_t diaAtual = 0;
 
 // ── Escrita atômica: salva em .tmp → copia para .bak → move para destino final ──
 // Nunca corrompe o arquivo principal mesmo se a energia cair no meio da escrita.
@@ -73,7 +92,7 @@ bool fsEnsureDir(const char* dir) {
 // ════════════════════════════════════════════════════════
 #define MAX_QUEST 8
 struct Questao {
-  char txt[120];
+  char txt[1020];
   char a[48], b[48], c[48], d[48];
   char gab;
   char obs[160];
@@ -219,32 +238,46 @@ String je(const char* s){
 // ════════════════════════════════════════════════════════
 char nomeAtividade[48] = "Atividade";  // professor pode nomear antes de arquivar
 
-// Retorna próximo ID de histórico (1..MAX_HIST, rotativo)
+// ── Sequência de histórico: NUNCA roda/expira sozinha. Cada atividade
+// arquivada ganha um ID novo e permanente (persistido em /histseq.json).
+// Se algum dia a flash encher, o admin decide manualmente o que apagar
+// (ver hAdmHistDel) — o firmware nunca sobrescreve histórico velho sozinho.
+int lerHistSeq() {
+  String raw = fsRead(PATH_HISTSEQ);
+  if (raw.length() == 0) return 0;
+  int p = raw.indexOf("\"seq\":");
+  if (p < 0) return 0;
+  return raw.substring(p + 6).toInt();
+}
+void salvarHistSeq(int seq) {
+  fsWrite(PATH_HISTSEQ, "{\"seq\":" + String(seq) + "}");
+}
 int proximoIdHist() {
-  int maior = 0;
-  File dir = LittleFS.open(DIR_HIST);
-  if (!dir) return 1;
-  File f = dir.openNextFile();
-  while (f) {
-    String nm = String(f.name());
-    int id = nm.toInt();
-    if (id > maior) maior = id;
-    f = dir.openNextFile();
-  }
-  int proximo = maior + 1;
-  if (proximo > MAX_HIST) proximo = 1;  // rotação
-  return proximo;
+  return lerHistSeq() + 1;
 }
 
-void arquivarAtividade() {
+// Retorna false (e não escreve nada) se a flash estiver perigosamente cheia,
+// em vez de arriscar corromper o filesystem escrevendo até faltar espaço.
+bool arquivarAtividade() {
+  if (!fsDisponivel) {
+    Serial.println("[HIST] AVISO: filesystem indisponível — atividade NÃO foi arquivada (fica só na RAM/dashboard).");
+    return false;
+  }
+  size_t usados = LittleFS.usedBytes(), total = LittleFS.totalBytes();
+  if (total > 0 && (usados * 100UL / total) > 92) {
+    Serial.printf("[HIST] ERRO: flash quase cheia (%u/%u bytes) — arquivamento recusado. Apague atividades antigas pelo painel.\n", (unsigned)usados, (unsigned)total);
+    return false;
+  }
+
   fsEnsureDir(DIR_HIST);
   int id = proximoIdHist();
-  char path[32];
-  snprintf(path, sizeof(path), "%s/%04d.json", DIR_HIST, id);
+  char path[40];
+  snprintf(path, sizeof(path), "%s/%05d.json", DIR_HIST, id);
 
   unsigned long ts = millis() / 1000;  // segundos desde boot (sem RTC)
 
   String j = "{\"id\":" + String(id);
+  j += ",\"dia\":" + String(diaAtual);
   j += ",\"nome\":" + String("\"") + String(nomeAtividade) + String("\"");
   j += ",\"ts\":" + String(ts);
   j += ",\"nQ\":" + String(nQuiz);
@@ -276,40 +309,55 @@ void arquivarAtividade() {
     j += "]}";
   }
   j += "]}";
-  if (fsWrite(path, j))
-    Serial.printf("[HIST] Arquivada atividade #%d em %s\n", id, path);
-  else
+  if (fsWrite(path, j)) {
+    salvarHistSeq(id);  // só avança a sequência se a escrita deu certo
+    Serial.printf("[HIST] Arquivada atividade #%d (dia #%u) em %s\n", id, diaAtual, path);
+    return true;
+  } else {
     Serial.printf("[HIST] ERRO ao arquivar em %s\n", path);
+    return false;
+  }
 }
 
-// Lista IDs de histórico disponíveis, do mais recente ao mais antigo
+// Lista atividades arquivadas, do mais recente ao mais antigo. Sem limite
+// fixo — cresce com quantas atividades existirem de fato na flash.
 String jsonListaHist() {
   String j = "{\"atividades\":[";
   File dir = LittleFS.open(DIR_HIST);
   if (!dir) { j += "]}"; return j; }
-  // Coleta até MAX_HIST ids
-  int ids[MAX_HIST]; int n = 0;
+
+  // 1ª passada: só conta quantos arquivos existem, pra alocar o array certo
+  int n = 0;
   File f = dir.openNextFile();
-  while (f && n < MAX_HIST) {
-    ids[n++] = String(f.name()).toInt();
-    f = dir.openNextFile();
-  }
-  // Ordena decrescente (simples bubble sort, lista pequena)
-  for (int a = 0; a < n - 1; a++)
-    for (int b = a + 1; b < n; b++)
+  while (f) { n++; f = dir.openNextFile(); }
+  dir.close();
+
+  if (n == 0) { j += "]}"; return j; }
+  int* ids = (int*) malloc(sizeof(int) * n);
+  if (!ids) { j += "]}"; return j; }  // sem memória — devolve lista vazia em vez de travar
+
+  dir = LittleFS.open(DIR_HIST);
+  int total = 0;
+  f = dir.openNextFile();
+  while (f && total < n) { ids[total++] = String(f.name()).toInt(); f = dir.openNextFile(); }
+  dir.close();
+
+  // Ordena decrescente (bubble sort — lista de atividades, não de milhares de itens)
+  for (int a = 0; a < total - 1; a++)
+    for (int b = a + 1; b < total; b++)
       if (ids[b] > ids[a]) { int t = ids[a]; ids[a] = ids[b]; ids[b] = t; }
 
-  for (int i = 0; i < n; i++) {
+  for (int i = 0; i < total; i++) {
     if (i) j += ",";
-    char path[32]; snprintf(path, sizeof(path), "%s/%04d.json", DIR_HIST, ids[i]);
+    char path[40]; snprintf(path, sizeof(path), "%s/%05d.json", DIR_HIST, ids[i]);
     String raw = fsRead(path);
     if (raw.length() > 0) {
-      // Extrai apenas cabeçalho: id, nome, ts, nQ, nAlunos
+      // Extrai apenas cabeçalho: id, dia, nome, ts, nQ, nAlunos
       // Faz parse manual mínimo para não consumir heap
       j += "{\"id\":" + String(ids[i]);
-      // Extrai "nome":"..."
-      int p1 = raw.indexOf("\"nome\":\"") + 8;
-      int p2 = raw.indexOf("\"", p1);
+      int p1 = raw.indexOf("\"dia\":") + 6; int p2 = raw.indexOf(",", p1);
+      if (p1 > 5) j += ",\"dia\":" + raw.substring(p1, p2);
+      p1 = raw.indexOf("\"nome\":\"") + 8; p2 = raw.indexOf("\"", p1);
       if (p1 > 7 && p2 > p1) j += ",\"nome\":\"" + raw.substring(p1, p2) + "\"";
       p1 = raw.indexOf("\"nQ\":") + 5; p2 = raw.indexOf(",", p1);
       if (p1 > 4) j += ",\"nQ\":" + raw.substring(p1, p2);
@@ -319,6 +367,7 @@ String jsonListaHist() {
     }
   }
   j += "]}";
+  free(ids);
   return j;
 }
 
@@ -353,14 +402,15 @@ void salvarQuiz(){
 void carregarQuiz(){
   String raw=fsRead(PATH_QUIZ);
   if(raw.length()==0) return;
-  StaticJsonDocument<8192> doc;
+  DynamicJsonDocument doc(16384);
   if(deserializeJson(doc,raw)) return;
   nQuiz=doc["nQuiz"]|0;
   gabLiberado=doc["gabLiberado"]|false;
   JsonArray qs=doc["qs"]; int i=0;
   for(JsonObject q:qs){
     if(i>=MAX_QUEST) break;
-    strncpy(quiz[i].txt,q["txt"]|"",119);
+    strncpy(quiz[i].txt,q["txt"]|"",sizeof(quiz[i].txt)-1);
+    quiz[i].txt[sizeof(quiz[i].txt)-1]=0;
     strncpy(quiz[i].a,  q["a"]|"",47);
     strncpy(quiz[i].b,  q["b"]|"",47);
     strncpy(quiz[i].c,  q["c"]|"",47);
@@ -1204,7 +1254,7 @@ select.inp2{cursor:pointer}
       <div id="qList"><p class="nenhum">Sem questões.</p></div>
       <hr>
       <label>Enunciado</label>
-      <textarea class="inp2" id="qE" placeholder="Digite a pergunta..." maxlength="119" rows="2"></textarea>
+      <textarea class="inp2" id="qE" placeholder="Digite a pergunta..." maxlength="1019" rows="4"></textarea>
       <div class="fr">
         <div><label>A</label><input class="inp2" type="text" id="qA" maxlength="47"></div>
         <div><label>B</label><input class="inp2" type="text" id="qB" maxlength="47"></div>
@@ -1505,7 +1555,7 @@ function carregarHistorico(){
       h+='<div style="display:flex;align-items:center;justify-content:space-between;padding:.5rem 0;border-bottom:1px solid var(--b)">';
       h+='<div>';
       h+='<div style="font-size:.65rem;color:var(--tx);font-weight:600">'+esc(a.nome||'Atividade')+'</div>';
-      h+='<div style="font-size:.52rem;color:var(--mu);margin-top:.15rem">'+( a.nQ||0)+' questões · '+(a.nAlunos||0)+' alunos</div>';
+      h+='<div style="font-size:.52rem;color:var(--mu);margin-top:.15rem">Dia #'+(a.dia||0)+' · '+( a.nQ||0)+' questões · '+(a.nAlunos||0)+' alunos</div>';
       h+='</div>';
       h+='<div style="display:flex;gap:.35rem">';
       h+='<button class="btn-perfil" onclick="verHistorico('+a.id+',\''+esc(a.nome||'Atividade')+'\')">Ver</button>';
@@ -2226,12 +2276,7 @@ void hAdmCmd(AsyncWebServerRequest* req){
     gabLiberado=false;marcarSessaoDirty();
   }
   // No hAdmCmd, adicione:
-  else if(a=="limparSessao"){
-    nVoters=0;
-    nAdm=0;
-    resetQuiz();
-    marcarSessaoDirty();
-  }
+  
   else if(a=="limparQuiz"){nQuiz=0;resetQuiz();salvarQuiz();marcarSessaoDirty();}
   else if(a=="liberarGabarito"){gabLiberado=true;salvarQuiz();}
   else if(a=="ocultarGabarito"){gabLiberado=false;salvarQuiz();}
@@ -2245,7 +2290,7 @@ void hAdmAddQ(AsyncWebServerRequest* req){
   if(nQuiz>=MAX_QUEST){req->send(200,"application/json","{\"erro\":\"Limite atingido.\"}");return;}
   if(!req->hasArg("e")||!req->hasArg("a")||!req->hasArg("b")){req->send(200,"application/json","{\"erro\":\"Campos obrigatórios.\"}");return;}
   Questao& q=quiz[nQuiz];
-  strncpy(q.txt,req->arg("e").c_str(),119);q.txt[119]=0;
+  strncpy(q.txt,req->arg("e").c_str(),sizeof(q.txt)-1);q.txt[sizeof(q.txt)-1]=0;
   strncpy(q.a,req->arg("a").c_str(),47);q.a[47]=0;
   strncpy(q.b,req->arg("b").c_str(),47);q.b[47]=0;
   strncpy(q.c,req->hasArg("c")?req->arg("c").c_str():"",47);q.c[47]=0;
@@ -2360,8 +2405,9 @@ void hAdmNomeAtividade(AsyncWebServerRequest* req){
 // ── Arquivar atividade atual no histórico ──
 void hAdmArquivar(AsyncWebServerRequest* req){
   if(!isAdm(req->client()->remoteIP().toString())){req->send(403,"text/plain","forbidden");return;}
-  arquivarAtividade();
-  req->send(200,"application/json","{\"ok\":true}");
+  bool ok = arquivarAtividade();
+  if(ok) req->send(200,"application/json","{\"ok\":true}");
+  else   req->send(200,"application/json","{\"ok\":false,\"erro\":\"falha ao arquivar — veja o serial (fs indisponível ou flash cheia)\"}");
 }
 
 // ── Listar histórico ──
@@ -2375,7 +2421,7 @@ void hAdmHistData(AsyncWebServerRequest* req){
   if(!isAdm(req->client()->remoteIP().toString())){req->send(403,"text/plain","forbidden");return;}
   if(!req->hasArg("id")){req->send(200,"application/json","{\"erro\":\"id obrigatório\"}");return;}
   int id=req->arg("id").toInt();
-  char path[32]; snprintf(path,sizeof(path),"%s/%04d.json",DIR_HIST,id);
+  char path[40]; snprintf(path,sizeof(path),"%s/%05d.json",DIR_HIST,id);
   if(!LittleFS.exists(path)){req->send(200,"application/json","{\"erro\":\"não encontrado\"}");return;}
   String raw=fsRead(path);
   req->send(200,"application/json",raw);
@@ -2386,9 +2432,26 @@ void hAdmHistDel(AsyncWebServerRequest* req){
   if(!isAdm(req->client()->remoteIP().toString())){req->send(403,"text/plain","forbidden");return;}
   if(!req->hasArg("id")){req->send(200,"application/json","{\"erro\":\"id obrigatório\"}");return;}
   int id=req->arg("id").toInt();
-  char path[32]; snprintf(path,sizeof(path),"%s/%04d.json",DIR_HIST,id);
+  char path[40]; snprintf(path,sizeof(path),"%s/%05d.json",DIR_HIST,id);
   LittleFS.remove(path);
   req->send(200,"application/json",jsonListaHist());
+}
+
+// ── Formatação MANUAL do filesystem (nunca automática) ──
+// Só executa se: (1) admin autenticado, (2) parâmetro confirmo=APAGAR_TUDO
+// enviado explicitamente. Existe pra casos em que a flash realmente corrompeu
+// e não há outro jeito — mas exige uma ação humana consciente, nunca acontece
+// sozinha no boot.
+void hAdmFormatarFS(AsyncWebServerRequest* req){
+  if(!isAdm(req->client()->remoteIP().toString())){req->send(403,"text/plain","forbidden");return;}
+  if(!req->hasArg("confirmo") || req->arg("confirmo") != "APAGAR_TUDO"){
+    req->send(400,"application/json","{\"erro\":\"envie ?confirmo=APAGAR_TUDO para confirmar. Isso apaga sessão, quiz e TODO o histórico permanentemente.\"}");
+    return;
+  }
+  Serial.println("[LittleFS] Formatação MANUAL solicitada via /admin/formatarFS — apagando tudo por pedido explícito do admin.");
+  bool ok = LittleFS.format();
+  fsDisponivel = LittleFS.begin(false);
+  req->send(200,"application/json", String("{\"ok\":") + (ok?"true":"false") + "}");
 }
 
 
@@ -2443,17 +2506,77 @@ void setup(){
     ESP.restart();
   }
 
-  if(!LittleFS.begin(false)){
-    // Primeira tentativa sem formatar — preserva dados
-    Serial.println("[LittleFS] Falhou sem format — tentando com format...");
-    if(!LittleFS.begin(true)){
-      Serial.println("[LittleFS] ERRO CRÍTICO — não foi possível montar!");
-    } else {
-      Serial.println("[LittleFS] Formatado e montado (dados perdidos — primeira vez?)");
+  // ── Motivo do reset — visibilidade que não existia antes ──
+  // Ajuda a diagnosticar se foi queda de energia, brownout, watchdog, panic
+  // (crash de código) ou reset normal via botão/ESP.restart().
+  {
+    esp_reset_reason_t razao = esp_reset_reason();
+    const char* nomeRazao;
+    switch(razao){
+      case ESP_RST_POWERON:   nomeRazao = "POWERON (ligou na tomada/USB)"; break;
+      case ESP_RST_SW:        nomeRazao = "SW (ESP.restart() no código)"; break;
+      case ESP_RST_PANIC:     nomeRazao = "PANIC (crash de firmware)"; break;
+      case ESP_RST_INT_WDT:   nomeRazao = "INT_WDT (watchdog de interrupção)"; break;
+      case ESP_RST_TASK_WDT:  nomeRazao = "TASK_WDT (watchdog de tarefa travada)"; break;
+      case ESP_RST_WDT:       nomeRazao = "WDT (outro watchdog)"; break;
+      case ESP_RST_BROWNOUT:  nomeRazao = "BROWNOUT (queda de tensão!)"; break;
+      case ESP_RST_DEEPSLEEP: nomeRazao = "DEEPSLEEP (acordou de sleep)"; break;
+      default:                nomeRazao = "outro/desconhecido"; break;
     }
-  } else Serial.println("[LittleFS] OK");
+    Serial.printf("[BOOT] Motivo do reset: %d — %s\n", (int)razao, nomeRazao);
+  }
 
-  fsEnsureDir(DIR_HIST);  // garante que /hist existe
+  // ── Montagem do LittleFS — NUNCA formata sozinho ──
+  // Tenta montar algumas vezes (falhas transitórias de flash acontecem);
+  // se realmente não conseguir, segue rodando em modo RAM-only em vez de
+  // apagar sessão/histórico com um LittleFS.begin(true) automático.
+  fsDisponivel = false;
+  for(int tentativa=1; tentativa<=3 && !fsDisponivel; tentativa++){
+    if(LittleFS.begin(false)){
+      fsDisponivel = true;
+    } else {
+      Serial.printf("[LittleFS] Falha ao montar (tentativa %d/3)\n", tentativa);
+      delay(400);
+    }
+  }
+  if(fsDisponivel){
+    Serial.println("[LittleFS] OK");
+  } else {
+    Serial.println("[LittleFS] ################################################");
+    Serial.println("[LittleFS] ERRO CRÍTICO: não montou após 3 tentativas.");
+    Serial.println("[LittleFS] NÃO vou formatar sozinho — isso apagaria sessão,");
+    Serial.println("[LittleFS] quiz e todo o histórico. O sistema vai continuar");
+    Serial.println("[LittleFS] rodando (a aula não para), mas SEM salvar nada em");
+    Serial.println("[LittleFS] flash até o problema ser resolvido. Verifique a");
+    Serial.println("[LittleFS] fonte de energia (brownout sob carga de WiFi) ou,");
+    Serial.println("[LittleFS] em último caso, formate manualmente via:");
+    Serial.println("[LittleFS]   GET /admin/formatarFS?confirmo=APAGAR_TUDO");
+    Serial.println("[LittleFS] ################################################");
+  }
+
+  // ── Controle de "dia letivo" sem NTP/internet, via memória RTC ──
+  {
+    esp_reset_reason_t razao = esp_reset_reason();
+    bool energiaCortada = (razao == ESP_RST_POWERON) || (rtcMagicDia != DIA_MAGIC);
+    if(energiaCortada){
+      int ultimo = 0;
+      if(fsDisponivel){
+        String r = fsRead(PATH_DIA);
+        int p = r.indexOf("\"dia\":");
+        if(p >= 0) ultimo = r.substring(p + 6).toInt();
+      }
+      diaAtual = (uint16_t)(ultimo + 1);
+      if(fsDisponivel) fsWrite(PATH_DIA, "{\"dia\":" + String(diaAtual) + "}");
+      rtcMagicDia = DIA_MAGIC;
+      rtcDiaAtual = diaAtual;
+      Serial.printf("[DIA] Energia foi cortada -> novo dia letivo: #%u\n", diaAtual);
+    } else {
+      diaAtual = rtcDiaAtual;
+      Serial.printf("[DIA] Reboot sem perda de energia -> continua dia #%u\n", diaAtual);
+    }
+  }
+
+  fsEnsureDir(DIR_HIST);  // garante que /hist existe (se fs disponível)
   prepararCachePaginas(); // pré-renderiza HTML+CSS uma vez no boot, em vez de a cada request
 
   Serial.println("[STA] Modo: STA puro (servidor)");
@@ -2506,6 +2629,7 @@ void setup(){
   server.on("/admin/historico",     HTTP_GET, hAdmHistorico);
   server.on("/admin/histData",      HTTP_GET, hAdmHistData);
   server.on("/admin/histDel",       HTTP_GET, hAdmHistDel);
+  server.on("/admin/formatarFS",    HTTP_GET, hAdmFormatarFS);
   // Captive portal — iOS, Windows, Linux
   server.on("/nm-check.txt",             HTTP_GET, hCaptive);  // NetworkManager (Linux)
   server.on("/check_200_public.txt",     HTTP_GET, hCaptive);  // GNOME NetworkManager
@@ -2527,7 +2651,8 @@ void setup(){
   Serial.printf("ip: %s\n", WiFi.localIP().toString().c_str());
   Serial.printf("MAC: %s\n", WiFi.macAddress().c_str());
   Serial.printf("Heap livre: %u bytes\n", ESP.getFreeHeap());
-  Serial.printf("LittleFS used: %u / %u bytes\n", LittleFS.usedBytes(), LittleFS.totalBytes());
+  Serial.printf("LittleFS: %s | used: %u / %u bytes\n", fsDisponivel ? "OK" : "INDISPONIVEL (modo RAM-only)", LittleFS.usedBytes(), LittleFS.totalBytes());
+  Serial.printf("Dia letivo atual: #%u\n", diaAtual);
 }
 
 void loop(){
@@ -2539,3 +2664,4 @@ void loop(){
     ultimoSalvamento = agora;
   }
 }
+

@@ -3,22 +3,22 @@
   "gabLiberado": false,
   "qs": [
     {
-      "txt": "O numero mensal de passagens de certa empresa aerea: jan=33.000, fev=34.500, mar=36.000. Padrao se mantem. Quantas em julho?",
-      "a": "38.000", "b": "40.500", "c": "41.000", "d": "42.000",
+      "txt": "Uma P.A. finita tem primeiro termo igual a 10, segundo termo igual a 7, e último termo igual a -80. Quantos termos tem essa P.A. ?",
+      "a": "22", "b": "25", "c": "31", "d": "40",
+      "gab": "C",
+      "obs": ""
+    },
+    {
+      "txt": "Amanda decidiu voltar a usar uma caixinha de um banco digital para guardar dinheiro. Essa conta tinha um saldo inicial de R$ 500,00, e a partir do primeiro mês ela decide investir R$ 150,00 mensalmente. Qual será o saldo final após 2 anos de depósitos mensais?",
+      "a": "R$ 800,00", "b": "R$ 1200,00", "c": "R$ 3.600,00", "d": "R$ 4.100,00",
       "gab": "D",
-      "obs": "PA com razao 1500. a7 = 33000 + 6x1500 = 42.000."
+      "obs": ""
     },
     {
-      "txt": "Numa PA, o primeiro termo e 5 e a razao e 3. Qual e o 10 termo?",
-      "a": "28", "b": "30", "c": "32", "d": "35",
-      "gab": "C",
-      "obs": "an = a1 + (n-1)*r -> a10 = 5 + 9x3 = 32."
-    },
-    {
-      "txt": "Os 5 primeiros termos de uma PA sao 2, 5, 8, 11, 14. Qual e a soma?",
-      "a": "35", "b": "38", "c": "40", "d": "42",
-      "gab": "C",
-      "obs": "Sn = n*(a1+an)/2 = 5*(2+14)/2 = 40."
+      "txt": "Uma P.A. tem primeiro termo 1, e razão 8. Qual é o termo 120 dessa P.A. ?",
+      "a": "865", "b": "953", "c": "1057", "d": "1193",
+      "gab": "B",
+      "obs": ""
     }
   ]
 }
