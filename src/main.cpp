@@ -13,7 +13,7 @@
 #define BAUD       115200
 
 const char* AP_SSID   = "Sala Interativa";
-const char* AP_PASS   = "122REG3";
+const char* AP_PASS   = "122REG34";
 const char* ADMIN_PWD = "2REG3";
 
 #define PATH_SESSAO  "/sessao.json"
@@ -134,6 +134,25 @@ volatile bool sessaoDirty = false;
 unsigned long ultimoSalvamento = 0;
 const unsigned long SALVAR_INTERVALO_MS = 10000UL;
 inline void marcarSessaoDirty(){ sessaoDirty = true; }
+
+// ── Mesmo padrão acima, agora pro quiz: salvar quiz.json bloqueava a resposta
+// HTTP (fsWrite faz 3 operações de flash: .tmp, .bak, rename final) direto
+// dentro do handler — travando o servidor pra TODOS os clientes conectados
+// enquanto a escrita não terminava. Agora só marca "sujo" e o loop() salva.
+volatile bool quizDirty = false;
+unsigned long ultimoSalvamentoQuiz = 0;
+const unsigned long SALVAR_QUIZ_INTERVALO_MS = 2000UL; // curto: ações de admin são raras, mas não devem demorar a persistir
+inline void marcarQuizDirty(){ quizDirty = true; }
+
+// ── Arquivamento de atividade: o JSON é montado na hora (rápido, só CPU/RAM),
+// mas a ESCRITA em flash (a parte lenta) fica pendente pro loop() processar.
+// Assim o botão "Arquivar" responde na hora e não trava o servidor.
+volatile bool histEscritaPendente = false;
+String histJsonPendente = "";
+char histPathPendente[40] = "";
+int histIdPendente = 0;
+volatile bool histUltimoResultado = false; // resultado da última escrita processada
+volatile bool histTemResultadoNovo = false;
 
 // ════════════════════════════════════════════════════════
 //  ÍNDICE DE LIVROS
@@ -1202,6 +1221,33 @@ select.inp2{cursor:pointer}
 .nenhum{font-size:.6rem;color:var(--mu);text-align:center;padding:.75rem;letter-spacing:.06em}
 .chips{display:flex;flex-wrap:wrap;gap:.28rem;margin:.45rem 0}
 .pchip{display:inline-flex;align-items:center;gap:.22rem;background:#00ffa310;border:1px solid #00ffa330;border-radius:4px;padding:.16rem .42rem;font-size:.5rem;color:var(--on);letter-spacing:.04em}
+.hist-dia{margin-bottom:.6rem;border:1px solid var(--b);border-radius:11px;overflow:hidden}
+.hist-dia-hd{display:flex;align-items:center;justify-content:space-between;padding:.65rem .8rem;background:var(--b);cursor:pointer;user-select:none}
+.hist-dia-hd:hover{background:var(--b2)}
+.hist-dia-tit{font-family:'DM Serif Display',serif;font-size:.95rem;color:var(--ac);font-style:italic}
+.hist-dia-sub{font-size:.5rem;color:var(--mu);letter-spacing:.06em;text-transform:uppercase;margin-top:.1rem}
+.hist-dia-arrow{font-size:.6rem;color:var(--mu);transition:transform .2s}
+.hist-dia-arrow.aberto{transform:rotate(90deg)}
+.hist-dia-body{display:none;padding:.6rem .7rem}
+.hist-dia-body.aberto{display:block}
+.hist-item{display:flex;align-items:center;justify-content:space-between;gap:.5rem;padding:.55rem .6rem;background:var(--s);border:1px solid var(--b);border-radius:9px;margin-bottom:.4rem}
+.hist-item:last-child{margin-bottom:0}
+.hist-item-nome{font-size:.64rem;color:var(--tx);font-weight:600}
+.hist-item-meta{font-size:.5rem;color:var(--mu);letter-spacing:.05em;margin-top:.18rem}
+.hist-item-btns{display:flex;gap:.3rem;flex-shrink:0}
+.arq-box{background:var(--b);border-radius:9px;padding:.7rem .8rem;margin-bottom:.85rem;display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}
+.arq-box input{flex:1;min-width:120px}
+.arq-box .btn{flex:0 0 auto;white-space:nowrap;padding:.7rem 1rem}
+.bar-chart{display:flex;flex-direction:column;gap:.4rem;margin-top:.4rem}
+.bar-row{display:flex;align-items:center;gap:.5rem}
+.bar-lbl{font-size:.55rem;color:var(--mu);min-width:2.4rem;text-align:right;flex-shrink:0}
+.bar-track{flex:1;background:var(--b);border-radius:5px;height:1.05rem;overflow:hidden;position:relative}
+.bar-fill{height:100%;border-radius:5px;display:flex;align-items:center;justify-content:flex-end;padding-right:.35rem;transition:width .4s}
+.bar-fill span{font-size:.5rem;font-weight:600;color:#001a0d;white-space:nowrap}
+.hist-stat-row{display:flex;gap:.5rem;margin-bottom:.7rem}
+.hist-stat{flex:1;background:var(--b);border-radius:8px;padding:.55rem .6rem;text-align:center}
+.hist-stat .v{font-family:'DM Serif Display',serif;font-size:1.15rem;color:var(--tx)}
+.hist-stat .l{font-size:.48rem;color:var(--mu);letter-spacing:.07em;text-transform:uppercase;margin-top:.1rem}
 </style></head><body>
 <div class="school-bar">
   <div class="school-name">E.E. Ephigenia</div>
@@ -1287,7 +1333,15 @@ select.inp2{cursor:pointer}
   <!-- ABA: HISTORICO -->
   <div class="tab-pane" id="pane-historico">
     <div class="card">
-      <div class="sect">🗂 Atividades Arquivadas</div>
+      <div class="sect">📥 Arquivar atividade atual</div>
+      <div class="arq-box">
+        <input class="inp2" style="margin-bottom:0" type="text" id="nomeAtivInp" placeholder="Nome da atividade (opcional)" maxlength="47">
+        <button class="btn btn-ac btn-sm" onclick="arquivarAtual()">📥 Arquivar agora</button>
+      </div>
+      <p style="font-size:.55rem;color:var(--mu);line-height:1.5;margin-top:-.4rem">Salva o quiz + todos os alunos, respostas e tempos de hoje no histórico permanente, com o rótulo do dia letivo #<span id="diaAtualLbl">—</span>. Isso NÃO reseta o quiz atual.</p>
+    </div>
+    <div class="card">
+      <div class="sect">🗂 Atividades Arquivadas — por dia letivo</div>
       <div id="histLista"><p class="nenhum">Carregando...</p></div>
     </div>
     <div class="card" id="histDetalhe" style="display:none">
@@ -1295,6 +1349,8 @@ select.inp2{cursor:pointer}
         <div class="sect" style="margin:0" id="histDetTitulo">Detalhe</div>
         <button class="btn-perfil" onclick="fecharDetalhe()">X Fechar</button>
       </div>
+      <div class="hist-stat-row" id="histDetStats"></div>
+      <div id="histDetChart"></div>
       <div id="histDetConteudo"></div>
     </div>
   </div>
@@ -1446,6 +1502,8 @@ function renderAlunosTabela(d){
 function atualizar(d){
   ultimoD=d;
   document.getElementById('tAlunos').textContent=d.cl||0;
+  var diaLbl=document.getElementById('diaAtualLbl');
+  if(diaLbl) diaLbl.textContent=d.dia||'—';
   var gl=d.gabLiberado||false;
   var gsEl=document.getElementById('gabStatus');
   gsEl.textContent=gl?'VISÍVEL':'OCULTO';gsEl.style.color=gl?'var(--on)':'var(--off)';
@@ -1512,6 +1570,26 @@ function cancelarEdicao(){
 
 var msgs={resetQuiz:'↺ Prova resetada',resetQuizResp:'↺ Respostas limpas',limparQuiz:'🗑 Quiz limpo',liberarGabarito:'👁 Gabarito visível',ocultarGabarito:'🙈 Gabarito oculto',abrirProva:'▶ Prova aberta',fecharProva:'🔒 Encerrada'};
 function cmd(a){fetch('/admin/cmd?a='+a).then(r=>r.json()).then(d=>{toast(msgs[a]||'OK');atualizar(d)}).catch(()=>toast('Erro.'))}
+function arquivarAtual(){
+  var nomeEl=document.getElementById('nomeAtivInp');
+  var nome=nomeEl.value.trim();
+  var passo2=function(){
+    fetch('/admin/arquivar').then(r=>r.json()).then(function(d){
+      if(d.ok){
+        toast('Atividade arquivada ✓');
+        nomeEl.value='';
+        carregarHistorico();
+      } else {
+        toast(d.erro||'Falha ao arquivar.');
+      }
+    }).catch(()=>toast('Erro ao arquivar.'));
+  };
+  if(nome.length>0){
+    fetch('/admin/nomeAtiv?nome='+encodeURIComponent(nome)).then(passo2).catch(()=>toast('Erro.'));
+  } else {
+    passo2();
+  }
+}
 function addOuEditQ(){
   var e=document.getElementById('qE').value.trim(),a=document.getElementById('qA').value.trim(),b=document.getElementById('qB').value.trim();
   if(!e||!a||!b){toast('Enunciado + A e B obrigatórios.');return}
@@ -1544,24 +1622,47 @@ function tornarElegivel(ip){
     .catch(()=>toast('Erro.'));
 }
 
-function carregarHistorico(){
+var _diasAbertos={};
+function toggleDia(dia){
+  _diasAbertos[dia]=!_diasAbertos[dia];
+  carregarHistorico(true);
+}
+function carregarHistorico(manterEstado){
   var el=document.getElementById('histLista');
-  el.innerHTML='<p class="nenhum">Carregando...</p>';
+  if(!manterEstado) el.innerHTML='<p class="nenhum">Carregando...</p>';
   fetch('/admin/historico').then(r=>r.json()).then(function(d){
     var ats=d.atividades||[];
     if(!ats.length){el.innerHTML='<p class="nenhum">Nenhuma atividade arquivada.</p>';return;}
-    var h='';
+    var grupos={};
     ats.forEach(function(a){
-      h+='<div style="display:flex;align-items:center;justify-content:space-between;padding:.5rem 0;border-bottom:1px solid var(--b)">';
-      h+='<div>';
-      h+='<div style="font-size:.65rem;color:var(--tx);font-weight:600">'+esc(a.nome||'Atividade')+'</div>';
-      h+='<div style="font-size:.52rem;color:var(--mu);margin-top:.15rem">Dia #'+(a.dia||0)+' · '+( a.nQ||0)+' questões · '+(a.nAlunos||0)+' alunos</div>';
+      var dia=a.dia||0;
+      if(!grupos[dia]) grupos[dia]=[];
+      grupos[dia].push(a);
+    });
+    var dias=Object.keys(grupos).map(Number).sort(function(a,b){return b-a;});
+    if(Object.keys(_diasAbertos).length===0) _diasAbertos[dias[0]]=true; // abre o dia mais recente na primeira carga
+    var h='';
+    dias.forEach(function(dia){
+      var lista=grupos[dia];
+      var totalAlunos=lista.reduce(function(s,a){return s+(a.nAlunos||0);},0);
+      var aberto=!!_diasAbertos[dia];
+      h+='<div class="hist-dia">';
+      h+='<div class="hist-dia-hd" onclick="toggleDia('+dia+')">';
+      h+='<div><div class="hist-dia-tit">Dia letivo #'+dia+'</div>';
+      h+='<div class="hist-dia-sub">'+lista.length+' atividade'+(lista.length>1?'s':'')+' · '+totalAlunos+' participações</div></div>';
+      h+='<div class="hist-dia-arrow'+(aberto?' aberto':'')+'">▶</div>';
       h+='</div>';
-      h+='<div style="display:flex;gap:.35rem">';
-      h+='<button class="btn-perfil" onclick="verHistorico('+a.id+',\''+esc(a.nome||'Atividade')+'\')">Ver</button>';
-      h+='<button class="qdel" onclick="delHistorico('+a.id+')">✕</button>';
-      h+='</div>';
-      h+='</div>';
+      h+='<div class="hist-dia-body'+(aberto?' aberto':'')+'">';
+      lista.forEach(function(a){
+        h+='<div class="hist-item">';
+        h+='<div><div class="hist-item-nome">'+esc(a.nome||'Atividade')+'</div>';
+        h+='<div class="hist-item-meta">'+(a.nQ||0)+' questões · '+(a.nAlunos||0)+' alunos</div></div>';
+        h+='<div class="hist-item-btns">';
+        h+='<button class="btn-perfil" onclick="verHistorico('+a.id+',\''+esc(a.nome||'Atividade')+'\')">Ver</button>';
+        h+='<button class="qdel" onclick="delHistorico('+a.id+')">✕</button>';
+        h+='</div></div>';
+      });
+      h+='</div></div>';
     });
     el.innerHTML=h;
   }).catch(function(){el.innerHTML='<p class="nenhum" style="color:var(--off)">Erro ao carregar.</p>';});
@@ -1569,33 +1670,62 @@ function carregarHistorico(){
 
 function verHistorico(id, nome){
   fetch('/admin/histData?id='+id).then(r=>r.json()).then(function(d){
-    document.getElementById('histDetTitulo').textContent=nome;
+    document.getElementById('histDetTitulo').textContent=nome+' · Dia #'+(d.dia||0);
     var nQ=d.nQ||0;
     var alunos=d.alunos||[];
-    var h='<table class="integ-table">';
-    h+='<tr><th>Aluno</th>';
+    var qs=d.qs||[];
+    var acertosPorQ=new Array(nQ).fill(0);
+    var respPorQ=new Array(nQ).fill(0);
+    var somaPct=0, alunosComResp=0;
+
+    var h='<table class="integ-table"><tr><th>Aluno</th>';
     for(var q=0;q<nQ;q++) h+='<th style="text-align:center">Q'+(q+1)+'</th>';
     h+='<th style="text-align:center">Acertos</th></tr>';
     alunos.forEach(function(a){
       var rs=a.resp||[];
-      var qs=d.qs||[];
-      var acertos=0;
+      var acertos=0, respondeu=false;
       h+='<tr><td style="font-size:.6rem">'+esc(a.nome)+'</td>';
       for(var k=0;k<nQ;k++){
-        var r=rs[k]||'—';
+        var r=rs[k]||'';
         var gab=qs[k]?qs[k].gab:'';
         var cor='color:var(--mu)';
-        if(r!=='—'&&gab){
-          if(r===gab){cor='color:var(--on)';acertos++;}
-          else cor='color:var(--off)';
+        if(r){
+          respondeu=true;
+          respPorQ[k]++;
+          if(gab){
+            if(r===gab){cor='color:var(--on)';acertos++;acertosPorQ[k]++;}
+            else cor='color:var(--off)';
+          }
         }
-        h+='<td style="text-align:center;font-size:.58rem;'+cor+'">'+esc(r)+'</td>';
+        h+='<td style="text-align:center;font-size:.58rem;'+cor+'">'+esc(r||'—')+'</td>';
       }
       var pct=nQ>0?Math.round(acertos/nQ*100):0;
-      h+='<td style="text-align:center;font-size:.62rem;color:var(--blue)">'+acertos+'/'+nQ+' ('+pct+'%)</td>';
-      h+='</tr>';
+      h+='<td style="text-align:center;font-size:.62rem;color:var(--blue)">'+acertos+'/'+nQ+' ('+pct+'%)</td></tr>';
+      if(respondeu){somaPct+=pct;alunosComResp++;}
     });
     h+='</table>';
+
+    var mediaPct=alunosComResp>0?Math.round(somaPct/alunosComResp):0;
+    var statsHtml='<div class="hist-stat"><div class="v">'+alunos.length+'</div><div class="l">Alunos</div></div>';
+    statsHtml+='<div class="hist-stat"><div class="v">'+nQ+'</div><div class="l">Questões</div></div>';
+    statsHtml+='<div class="hist-stat"><div class="v">'+mediaPct+'%</div><div class="l">Média acertos</div></div>';
+    document.getElementById('histDetStats').innerHTML=statsHtml;
+
+    var chartHtml='';
+    if(nQ>0){
+      chartHtml+='<div class="sect" style="border:none;padding-bottom:.2rem;margin-bottom:.3rem">📊 Acertos por questão</div><div class="bar-chart">';
+      for(var k=0;k<nQ;k++){
+        var base=respPorQ[k];
+        var pctQ=base>0?Math.round(acertosPorQ[k]/base*100):0;
+        var cor=pctQ>=70?'var(--on)':(pctQ>=40?'var(--yw)':'var(--off)');
+        var txtCor=pctQ<40?'#fff':'#001a0d';
+        chartHtml+='<div class="bar-row"><div class="bar-lbl">Q'+(k+1)+'</div><div class="bar-track">';
+        chartHtml+='<div class="bar-fill" style="width:'+Math.max(pctQ,8)+'%;background:'+cor+'"><span style="color:'+txtCor+'">'+pctQ+'%</span></div></div></div>';
+      }
+      chartHtml+='</div>';
+    }
+    document.getElementById('histDetChart').innerHTML=chartHtml;
+
     document.getElementById('histDetConteudo').innerHTML=h;
     document.getElementById('histDetalhe').style.display='block';
   }).catch(function(){toast('Erro ao carregar detalhe.');});
@@ -1604,13 +1734,15 @@ function verHistorico(id, nome){
 function fecharDetalhe(){
   document.getElementById('histDetalhe').style.display='none';
   document.getElementById('histDetConteudo').innerHTML='';
+  document.getElementById('histDetStats').innerHTML='';
+  document.getElementById('histDetChart').innerHTML='';
 }
 
 function delHistorico(id){
   if(!confirm('Apagar esta atividade do histórico?')) return;
   fetch('/admin/histDel?id='+id).then(r=>r.json()).then(function(){
     toast('Atividade removida.');
-    carregarHistorico();
+    carregarHistorico(true);
     fecharDetalhe();
   }).catch(function(){toast('Erro.');});
 }
@@ -1970,6 +2102,7 @@ String jsonQuizAluno(Voter* v){
 
 String jsonAdmin(){
   String j="{\"cl\":"+String(nVoters);
+  j+=",\"dia\":"+String(diaAtual);
   j+=",\"nQ\":"+String(nQuiz);
   j+=",\"gabLiberado\":"+(String)(gabLiberado?"true":"false");
   j+=",\"provaAberta\":"+(String)(provaAberta?"true":"false");
@@ -2141,7 +2274,7 @@ void hCaptive(AsyncWebServerRequest* req){
   }
 
   // ── Qualquer outra URL — 302 para página principal ───────────────────────
-  String ip = WiFi.localIP().toString();
+  String ip = WiFi.softAPIP().toString();
   AsyncWebServerResponse* r = req->beginResponse(302);
   r->addHeader("Location", "http://" + ip + "/");
   r->addHeader("Cache-Control", "no-cache");
@@ -2165,13 +2298,18 @@ void hLivroImg(AsyncWebServerRequest* req){
   char path[32];
   snprintf(path,sizeof(path),"/%s%03d.jpg",livros[livroId].prefixo,p);
 
-  // DEBUG
-  Serial.printf("[IMG] livroId=%d p=%d prefixo='%s' path='%s'\n",
-    livroId, p, livros[livroId].prefixo, path);
-  Serial.printf("[IMG] exists=%d\n", LittleFS.exists(path));
-
-  if(!LittleFS.exists(path)){snprintf(path,sizeof(path),"/%s%d.jpg",livros[livroId].prefixo,p);}
-  if(!LittleFS.exists(path)){req->send(404,"text/plain","Pagina nao encontrada: "+String(path));return;}
+  // Antes: até 4 chamadas a LittleFS.exists()/open() por imagem (1 só de log +
+  // 2 redundantes de validação + a abertura implícita do beginResponse). Cada
+  // uma delas desliga cache/interrupções nos 2 núcleos por alguns ms pra
+  // acessar a flash — empilhadas a cada virada de página, isso engasgava o
+  // WiFi/AsyncTCP. Agora: no máximo 1 exists() extra (só se o formato %03d
+  // não bater), reaproveitando o resultado em vez de checar de novo.
+  bool existe = LittleFS.exists(path);
+  if(!existe){
+    snprintf(path,sizeof(path),"/%s%d.jpg",livros[livroId].prefixo,p);
+    existe = LittleFS.exists(path);
+  }
+  if(!existe){req->send(404,"text/plain","Pagina nao encontrada: "+String(path));return;}
   AsyncWebServerResponse* r=req->beginResponse(LittleFS,path,"image/jpeg");
   r->addHeader("Cache-Control","public, max-age=86400");
   req->send(r);
@@ -2479,32 +2617,27 @@ void setup(){
   pinMode(GPIO_PIN,OUTPUT);pinMode(LED_PIN,OUTPUT);
   digitalWrite(GPIO_PIN,LOW);digitalWrite(LED_PIN,LOW);
 
-  WiFi.mode(WIFI_STA);
-  WiFi.setTxPower(WIFI_POWER_7dBm); // máximo — melhor alcance e estabilidade p/ 15 alunos
+  WiFi.mode(WIFI_AP); // modo ponto de acesso
+  WiFi.setTxPower(WIFI_POWER_19_5dBm); // máximo real da escala do ESP32 — 7dBm era ~1/16 da potência
 
-  // IP fixo — deve bater com o que está configurado no D-Link como DNS primário
-  IPAddress localIP(192, 168, 0, 101);
-  IPAddress gateway(192, 168, 0, 254);
+  // IP fixo para o AP e DNS local do captive portal
+  IPAddress localIP(192, 168, 1, 4);
+  IPAddress gateway(192, 168, 1, 4);
   IPAddress subnet(255, 255, 255, 0);
-  IPAddress dns1(192, 168, 0, 254);
-  WiFi.config(localIP, gateway, subnet, dns1);
-
-  int tentativas = 0;
-  const int MAX_TENTATIVAS = 20;
-  WiFi.begin("SI-2.4G", "");
-
-  while(WiFi.status() != WL_CONNECTED && tentativas < MAX_TENTATIVAS){
-    delay(1000);
-    tentativas++;
-    Serial.printf("[WP2] Tentativa %d/%d\n", tentativas, MAX_TENTATIVAS);
-  }
-  if(WiFi.status() == WL_CONNECTED){
-    Serial.println("[WP2] Conectado! IP: " + WiFi.localIP().toString());
-  } else {
-    Serial.println("[WP2] Falhou após todas as tentativas — reiniciando ESP32...");
+  if(!WiFi.softAPConfig(localIP, gateway, subnet)){
+    Serial.println("[AP] Falha ao configurar IP do AP");
     delay(2000);
     ESP.restart();
   }
+  if(!WiFi.softAP(AP_SSID, AP_PASS)){
+    Serial.println("[AP] Falha ao iniciar o ponto de acesso");
+    delay(2000);
+    ESP.restart();
+  }
+  Serial.println("[AP] Ponto de acesso iniciado");
+  Serial.println("[AP] SSID: " + String(AP_SSID));
+  Serial.println("[AP] Senha: " + String(AP_PASS));
+  Serial.print("[AP] IP configurado: "); Serial.println(WiFi.softAPIP());
 
   // ── Motivo do reset — visibilidade que não existia antes ──
   // Ajuda a diagnosticar se foi queda de energia, brownout, watchdog, panic
@@ -2579,10 +2712,10 @@ void setup(){
   fsEnsureDir(DIR_HIST);  // garante que /hist existe (se fs disponível)
   prepararCachePaginas(); // pré-renderiza HTML+CSS uma vez no boot, em vez de a cada request
 
-  Serial.println("[STA] Modo: STA puro (servidor)");
-  Serial.print("[STA] IP:   "); Serial.println(WiFi.localIP());
-  Serial.print("[STA] Canal: "); Serial.println(WiFi.channel());
-  Serial.println("[STA] MAC:  " + WiFi.macAddress());
+  Serial.println("[AP] Modo: AP puro (servidor)");
+  Serial.print("[AP] IP:   "); Serial.println(WiFi.softAPIP());
+  Serial.print("[AP] Canal: "); Serial.println(WiFi.channel());
+  Serial.println("[AP] MAC:  " + WiFi.macAddress());
 
   carregarLivros();
    carregarQuiz();
@@ -2648,7 +2781,7 @@ void setup(){
   dnsServer.setTTL(1);   // TTL=1s — MIUI 14 não cacheia, sempre pergunta pro ESP
   dnsServer.start(53, "*", localIP);
   Serial.println("[DNS] Servidor DNS iniciado na porta 53");
-  Serial.printf("ip: %s\n", WiFi.localIP().toString().c_str());
+  Serial.printf("ip: %s\n", WiFi.softAPIP().toString().c_str());
   Serial.printf("MAC: %s\n", WiFi.macAddress().c_str());
   Serial.printf("Heap livre: %u bytes\n", ESP.getFreeHeap());
   Serial.printf("LittleFS: %s | used: %u / %u bytes\n", fsDisponivel ? "OK" : "INDISPONIVEL (modo RAM-only)", LittleFS.usedBytes(), LittleFS.totalBytes());
@@ -2664,4 +2797,3 @@ void loop(){
     ultimoSalvamento = agora;
   }
 }
-
